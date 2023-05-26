@@ -18,8 +18,7 @@ import (
 )
 
 type zookeeperContainer struct {
-	port     int
-	teardown func()
+	port int
 }
 
 type KafkaContainer struct {
@@ -27,8 +26,9 @@ type KafkaContainer struct {
 	topic     string
 	extPort   int
 	extIP     string
-	teardown  func()
+	teardown  []func()
 	log       *log.Logger
+	withUI    bool
 }
 
 // StartKafkaContainer ..
@@ -85,8 +85,9 @@ func (c *KafkaContainer) Close() {
 	if c == nil {
 		return
 	}
-	c.teardown()
-	c.zookeeper.teardown()
+	for i := len(c.teardown) - 1; i >= 0; i-- {
+		c.teardown[i]()
+	}
 
 	_ = pool.Get().Close()
 }
@@ -98,6 +99,12 @@ func (c *KafkaContainer) runLocal(ctx context.Context) error {
 
 	if err := c.runKafka(ctx); err != nil {
 		return fmt.Errorf("error starting kafka: %s", err)
+	}
+
+	if c.withUI {
+		if err := c.runKafkaUI(ctx); err != nil {
+			return fmt.Errorf("error starting kafka-ui: %s", err)
+		}
 	}
 
 	return nil
@@ -173,9 +180,7 @@ func (c *KafkaContainer) runZookeeper(_ context.Context) error {
 
 	c.log.Println("zookeeper is ready to accept connections")
 
-	c.zookeeper.teardown = func() {
-		_ = p.Pool().Purge(res)
-	}
+	c.teardown = append(c.teardown, func() { _ = p.Pool().Purge(res) })
 
 	return nil
 }
@@ -222,8 +227,7 @@ func (c *KafkaContainer) runKafka(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	c.log.Printf("kafka container created name=%s id=%s state=%s\n",
-		res.Container.Name, res.Container.ID, res.Container.State.StateString())
+	c.log.Printf("kafka container created name=%s id=%s\n", res.Container.Name, res.Container.ID)
 
 	// Check it is up and running
 	retryFunc := func() error {
@@ -236,7 +240,7 @@ func (c *KafkaContainer) runKafka(ctx context.Context) error {
 			return ferr
 		}
 
-		c.log.Println("Kafka cluster is ready to go")
+		c.log.Printf("Kafka cluster is ready: addr=%s", c.Address())
 		return nil
 	}
 
@@ -245,12 +249,69 @@ func (c *KafkaContainer) runKafka(ctx context.Context) error {
 		return err
 	}
 
-	c.teardown = func() {
-		_ = p.Pool().Purge(res)
-	}
+	c.teardown = append(c.teardown, func() { _ = p.Pool().Purge(res) })
 
 	return nil
 }
+
+func (c *KafkaContainer) runKafkaUI(ctx context.Context) error {
+	c.log.Println("running kafka-ui container on local")
+	p := pool.Get()
+
+	env := []string{
+		"KAFKA_CLUSTERS_0_NAME=test",
+		"KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092",
+		"KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181",
+	}
+	const (
+		containerName = "kafka_ui_test"
+	)
+
+	var err error
+	res, ok := p.Pool().ContainerByName(containerName)
+	if ok {
+		err = p.Pool().Purge(res)
+		if err != nil {
+			return err
+		}
+	}
+	res, err = p.Pool().RunWithOptions(&dockertest.RunOptions{
+		Name:         containerName,
+		Repository:   "provectuslabs/kafka-ui",
+		Env:          env,
+		ExposedPorts: []string{"8080/tcp"},
+		NetworkID:    p.Network().Network.ID,
+		Hostname:     "kafka",
+	})
+	if err != nil {
+		return err
+	}
+	port := res.GetPort("8080/tcp")
+
+	c.log.Printf("kafka-ui container created and available on http://localhost:%s\n", port)
+
+	c.teardown = append(c.teardown, func() { _ = p.Pool().Purge(res) })
+
+	return nil
+}
+
+/*
+  kafka-ui:
+    image: provectuslabs/kafka-ui
+    container_name: kafka-ui
+    platform: linux/amd64
+    depends_on:
+      - kafka
+    ports:
+      - "18080:8080"
+    restart: always
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=stg
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
+      - KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181
+    networks:
+      kafka_internal:
+*/
 
 func tcpPort(p interface{ Port() int }) string {
 	return fmt.Sprintf("%d/tcp", p.Port())

@@ -24,3 +24,9 @@ func WithLogger(l *log.Logger) Opt {
 		kc.log = l
 	}
 }
+
+func WithUI() Opt {
+	return func(kc *KafkaContainer) {
+		kc.withUI = true
+	}
+}
