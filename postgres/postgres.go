@@ -15,6 +15,7 @@ import (
 type PostgresContainer struct {
 	host       string
 	extPort    int
+	imageTag   string
 	dbname     string
 	dbuser     string
 	dbpassword string
@@ -33,6 +34,7 @@ func StartContainer(ctx context.Context, opts ...Opt) (*PostgresContainer, error
 		defaultDBName     = "test_db"
 		defaultDBUser     = "postgres"
 		defaultDBPassword = "123456"
+		defaultTag        = "14-alpine"
 	)
 
 	var err error
@@ -40,6 +42,7 @@ func StartContainer(ctx context.Context, opts ...Opt) (*PostgresContainer, error
 	c := PostgresContainer{
 		host:       defaultHost,
 		extPort:    defaultExtPort,
+		imageTag:   defaultTag,
 		dbname:     defaultDBName,
 		dbuser:     defaultDBUser,
 		dbpassword: defaultDBPassword, log: log.New(os.Stderr, "[PostgresContainer] ", log.Flags()),
@@ -112,36 +115,51 @@ func (c *PostgresContainer) runLocal(ctx context.Context) error {
 	const containerName = "pg_test"
 
 	res, ok := p.Pool().ContainerByName(containerName)
-	if !ok {
-		res, err = p.Pool().RunWithOptions(&dockertest.RunOptions{
-			Name:         containerName,
-			Repository:   "postgres",
-			Tag:          "14",
-			Env:          env,
-			ExposedPorts: []string{"5432"},
-			PortBindings: map[docker.Port][]docker.PortBinding{
-				"5432/tcp": {
-					{HostIP: c.host, HostPort: tcpPort(c)},
-				},
-			},
-			NetworkID: p.Network().Network.ID,
-			Platform:  "linux/amd64",
-		})
+	if ok {
+		err = p.Pool().Purge(res)
 		if err != nil {
-			return fmt.Errorf("could not start resource: %w", err)
+			return err
 		}
-		c.log.Printf("started container name=%s, id=%s, state=%s\n",
-			res.Container.Name, res.Container.ID, res.Container.State.StateString())
 	}
+	res, err = p.Pool().RunWithOptions(&dockertest.RunOptions{
+		Name:         containerName,
+		Repository:   "postgres",
+		Tag:          c.imageTag,
+		Env:          env,
+		ExposedPorts: []string{"5432"},
+		PortBindings: map[docker.Port][]docker.PortBinding{
+			"5432/tcp": {
+				{HostIP: c.host, HostPort: tcpPort(c)},
+			},
+		},
+		NetworkID: p.Network().Network.ID,
+		Platform:  "linux/amd64",
+	})
+	if err != nil {
+		return fmt.Errorf("could not start resource: %w", err)
+	}
+	c.log.Printf("started container name=%s, id=%s, state=%s\n",
+		res.Container.Name, res.Container.ID, res.Container.State.StateString())
 
-	err = p.Pool().Retry(func() error {
+	retryFunc := func() error {
+		c.log.Println("geting db connection")
 		db, ferr := c.DB(ctx)
 		if ferr != nil {
 			return ferr
 		}
 
-		return db.Ping(ctx)
-	})
+		c.log.Println("trying to connect to db")
+
+		err = db.Ping(ctx)
+		if err != nil {
+			c.log.Println("could not connect to db")
+			return nil
+		}
+		c.log.Println("connection successful")
+		return nil
+	}
+
+	err = p.Pool().Retry(retryFunc)
 	if err != nil {
 		return fmt.Errorf("could not connect to postgres database: %w", err)
 	}
@@ -184,6 +202,13 @@ func WithCreds(login, password string) Opt {
 func WithLogger(l *log.Logger) Opt {
 	return func(kc *PostgresContainer) {
 		kc.log = l
+	}
+}
+
+// WithImageTag use custom docker image tag for postgres.
+func WithImageTag(tag string) Opt {
+	return func(pc *PostgresContainer) {
+		pc.imageTag = tag
 	}
 }
 
